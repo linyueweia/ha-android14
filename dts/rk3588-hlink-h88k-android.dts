@@ -6,9 +6,10 @@
  *   本仓相对基线只做「Android 化」的最小增补，硬件描述一个字节不改：
  *     ① include rk3588-android.dtsi（optee/ramoops/drm-logo/vendor-storage/fiq-debugger/cma）
  *     ② reserved-memory/cma 去掉 android.dtsi 带来的 size，保留本板 reg（256M@256M）
- *     ③ &vop 补 vop-supply + 定频（缺 supply 会显示异常，T68M 同坑）
- *     ④ &display_subsystem 补 hdmi0_phy_pll 时钟（缺了 HDMI PHY 拿不到 PLL）
- *     ⑤ &route_hdmi0/1 补 connect 指向具体 vp（Android 侧需要显式路由）
+ *     ③ &vop 补 assigned-clocks/rates 800MHz（对齐厂商 Android 12 dtb；不写 vop-supply）
+ *     ④ &display_subsystem 补 hdmi0/hdmi1 两个 PHY PLL 时钟
+ *     ⑤ &route_hdmi0/1 补 connect 与 Android logo/force-output 属性
+ *   以上均以厂商 Android 12 固件里解出的 rk-kernel.dtb 为对照（见 dist/reference/）。
  *   原 iNextOS fork 说明：
  *   来源：armbian/linux-rockchip @ rk-6.1-rkr5.1
  *         arch/arm64/boot/dts/rockchip/rk3588-hinlink-h88k.dts
@@ -864,11 +865,25 @@
 &route_hdmi0 {
 	status = "okay";
 	connect = <&vp0_out_hdmi0>;
+	/* 以下四项是 Android 侧的：前三项决定 U-Boot/内核阶段用哪张 logo，
+	 * force-output 让没有 EDID 时也照常输出（厂商同配置）。 */
+	force-output;
+	logo,uboot = "logo.bmp";
+	logo,kernel = "logo_kernel.bmp";
+	logo,mode = "center";
+	charge_logo,mode = "center";
 };
 
 &route_hdmi1 {
 	status = "okay";
 	connect = <&vp1_out_hdmi1>;
+	/* 以下四项是 Android 侧的：前三项决定 U-Boot/内核阶段用哪张 logo，
+	 * force-output 让没有 EDID 时也照常输出（厂商同配置）。 */
+	force-output;
+	logo,uboot = "logo.bmp";
+	logo,kernel = "logo_kernel.bmp";
+	logo,mode = "center";
+	charge_logo,mode = "center";
 };
 
 &rknpu {
@@ -1113,16 +1128,18 @@
 };
 
 &vop {
+	/* 厂商 Android 12 dtb 同一节点只有这两个属性 + power-domains；
+	 * 不写 vop-supply（那是 RK3568 的形态，RK3588 的 VOP 由 power-domain 供电）。 */
 	assigned-clocks = <&cru ACLK_VOP>;
 	assigned-clock-rates = <800000000>;
-	vop-supply = <&vdd_log_s0>;
 	status = "okay";
 };
 
-/* HDMI PHY 的 PLL 要给 display-subsystem，否则 HDMI 输出拿不到时钟 */
+/* 两个 HDMI PHY 的 PLL 都要给 display-subsystem（厂商 clock-names 就是这个顺序），
+ * 少一个则对应口拿不到 PLL。 */
 &display_subsystem {
-	clocks = <&hdptxphy_hdmi0>;
-	clock-names = "hdmi0_phy_pll";
+	clocks = <&hdptxphy_hdmi0>, <&hdptxphy_hdmi1>;
+	clock-names = "hdmi0_phy_pll", "hdmi1_phy_pll";
 };
 
 &vop_mmu {
