@@ -220,7 +220,7 @@ def main():
             return open(p, "rb").read() if os.path.exists(p) else None
 
         uboot = solid("uboot.img")
-        misc = solid("misc.img")
+        # misc 见下面 plan 里的注释：故意不写
         dtbo = solid("dtbo.img")
         vbmeta = solid("vbmeta.img")
         baseparam = solid("baseparameter.img")
@@ -228,7 +228,11 @@ def main():
 
         plan = {
             "uboot_a": uboot, "uboot_b": uboot,
-            "misc": misc,
+            # misc 故意不写：留全 0 让 u-boot 把 AVB 元数据重建成 "_a, tries=7"。
+            # 若写友善那份 misc.img，里面可能带着旧的 tries 计数，前几次启动失败
+            # 会把它扣光，u-boot 按规则切到 _b 槽——而 _b 是空的，直接死在
+            # "DM_DEV_STATUS failed for system_b"。
+            # （TM-android14 的 rk3568 卡上踩过，见其 tfcard runbook 断点 7）
             "dtbo_a": dtbo, "dtbo_b": dtbo,
             "vbmeta_a": vbmeta, "vbmeta_b": vbmeta,
             "boot_a": boot, "boot_b": boot,

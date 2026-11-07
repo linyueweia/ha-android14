@@ -9,17 +9,20 @@
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| S1 | 编出 `rk3588-hlink-h88k.dtb`（Android 化） | 进行中 |
-| S2 | 换掉官方镜像里的 dtb，出 SD 卡镜像 | 未开始 |
-| S3 | SD 卡实机启动（串口 + HDMI） | 未开始 |
+| S1 | 编出 `rk3588-hlink-h88k.dtb`（Android 化） | ✅ 285,685 B / 1,568 节点 |
+| S2 | 换掉官方镜像里的 dtb，出 SD 卡镜像 | ✅ `out/h88k-a14-sd-8g.img`（8 GiB） |
+| S3 | SD 卡实机启动（串口 + HDMI） | ⏳ 等上板 |
 | S4 | 按失败点补 dts | 未开始 |
 | S5 | eMMC 线刷包（需先解决 U-Boot 共存） | 未开始 |
 
+产出的东西和怎么烧：见 **`docs/H88K-烧写指南.md`**。
+
 ## 为什么不能照抄 NanoPC-T6 的包
 
-友善 RK3588 Android 的板级 dtb 是 `rk3588-nanopi6-rev01 … rev0b`，**11 个硬件版本槽**，
-U-Boot 按板上的 hwrev 电阻/ADC 探测值挑一个。H88K 不是友善板，探测值不可预测，
-所以 S2 必须把 **11 个槽全部替换**成 H88K 的 dtb，只换 rev01 会走到原厂 T6 的树。
+友善 RK3588 Android 的板级 dtb 是 `rk3588-nanopi6-rev01 … rev0c`，**12 个硬件版本槽**
+（实测数出来的，不是推算），U-Boot 按板上的 hwrev 电阻/ADC 探测值挑一个。
+H88K 不是友善板，探测值不可预测，所以 S2 必须把 **12 个槽全部替换**成 H88K 的 dtb，
+只换 rev01 会走到原厂 T6 的树。
 
 ## dts 相对基线改了什么
 
@@ -30,10 +33,13 @@ U-Boot 按板上的 hwrev 电阻/ADC 探测值挑一个。H88K 不是友善板�
 
 1. `#include "rk3588-android.dtsi"` — 带来 optee / ramoops / drm-logo / vendor-storage / fiq-debugger / cma
 2. `reserved-memory/cma` 加 `/delete-property/ size;` — android.dtsi 的 8M 与本板 `reg` 256M@256M 不能共存
-3. `&vop` 补 `vop-supply = <&vdd_log_s0>` + 定频 800MHz — 缺 supply 会显示异常
-4. `&display_subsystem` 补 `hdmi0_phy_pll` 时钟 — 缺了 HDMI PHY 拿不到 PLL
-5. `&route_hdmi0/1` 补 `connect` 指向具体 vp
+3. `&vop` 只定频 800MHz，**不写 vop-supply**（厂商 A12 dtb 同节点也没有；RK3588 的 VOP 走 power-domain，
+   `vop-supply` 是 RK3568 的形态）
+4. `&display_subsystem` 补 `hdmi0_phy_pll` + `hdmi1_phy_pll` 两个时钟 — 少一个则对应口拿不到 PLL
+5. `&route_hdmi0/1` 补 `connect` + `force-output` + logo 属性
 6. `compatible` 增补 `hlink,h88k`（实机 `/proc/device-tree/compatible` 是这个，不是 `hinlink`）
+
+以上 3/4/5 都以厂商 Android 12 固件里解出的 `rk-kernel.dtb` 为对照（见 `dist/reference/`）。
 
 ## 实机勘察（2026-11-07）
 
@@ -46,10 +52,22 @@ U-Boot 按板上的 hwrev 电阻/ADC 探测值挑一个。H88K 不是友善板�
 
 ## CI
 
-`dtb-build.yml`：稀疏克隆 `kernel-6.1`（带 cache）、放 dts、Makefile 注册、用
-`nanopi6_android_defconfig` + `CONFIG_SND_SOC_ES8388=y` 编单板 dtb，
-然后断言 Android 关键节点（optee/ramoops/drm-logo/vendor-storage/fiq-debugger/chosen.bootargs/cma/vop-supply）。
+`dtb-build.yml`：**不克隆内核树**。先在本地把 dtb 的 `#include` 闭包抓进仓库
+（`tools/fetch_dts_tree.py` → `vendor/dts-tree/`，27 个文件 / 455KB），
+CI 里只做 `cpp -nostdinc -I... -undef -D__DTS__` + `dtc -@`，
+再断言 Android 关键节点（optee / ramoops / drm-logo / vendor-storage / fiq-debugger /
+chosen.bootargs 有 `console=ttyFIQ0` / cma 只有 reg / vop 无 supply 但 800MHz /
+display-subsystem 两个 PHY PLL），最后上传 artifact。
+
+**全程 40-60 秒**（之前从 gitea 克隆整棵树跑 31 分钟连 clone 都没完成）。
 
 ```bash
 gh workflow run dtb-build.yml   # 或网页 Actions → dtb-build → Run workflow
+```
+
+闭包要维护时：
+
+```bash
+python tools/fetch_dts_tree.py            # 增量补齐（8 并发，gitea 会 503 限流就降线程）
+python tools/fetch_dts_tree.py --verify   # 只校验，确认每个 #include 都能本地解析
 ```

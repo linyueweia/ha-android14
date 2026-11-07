@@ -5,3 +5,5 @@ sdk/
 *.img
 __pycache__/
 *.pyc
+out/
+extracted/
