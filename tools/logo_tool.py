@@ -111,11 +111,25 @@ def cmd_set(args):
             raise SystemExit("%s is not a BMP" % path)
         w, h = struct.unpack_from("<ii", blob, 18)
         bpp = struct.unpack_from("<H", blob, 28)[0]
-        if (w, h) != (args.expect_w, args.expect_h) or bpp != 8:
+        # stock geometry comes from the entry being replaced, so the same tool
+        # works on the 512x128/24bpp FriendlyElec slot and the 654x270/8bpp one
+        ew, eh, ebpp = args.expect_w, args.expect_h, args.expect_bpp
+        if ew is None or eh is None or ebpp is None:
+            cur = hits[0]["data"]
+            if cur[:2] != b"BM":
+                raise SystemExit("%s: existing entry is not a BMP, pass --expect-*" % name)
+            ew, eh = struct.unpack_from("<ii", cur, 18)
+            ebpp = struct.unpack_from("<H", cur, 28)[0]
+        if (w, abs(h)) != (ew, abs(eh)) or bpp != ebpp:
             raise SystemExit(
-                "%s is %dx%d/%dbpp but this panel expects %dx%d/8bpp "
+                "%s is %dx%d/%dbpp but the slot expects %dx%d/%dbpp "
                 "(keep the stock geometry, otherwise U-Boot shows garbage)"
-                % (path, w, h, bpp, args.expect_w, args.expect_h))
+                % (path, w, h, bpp, ew, eh, ebpp))
+        if (h > 0) != (eh > 0):
+            print("!! orientation differs: %s is %s, slot is %s -- U-Boot honours "
+                  "biHeight sign, regenerate with --topdown/without it to match"
+                  % (path, "bottom-up" if h > 0 else "top-down",
+                     "bottom-up" if eh > 0 else "top-down"))
         for e in hits:
             old = len(e["data"])
             e["data"] = blob
@@ -128,7 +142,9 @@ def cmd_set(args):
     # keep everything after the second stage (v2 header may carry a separate dtb
     # segment -- this vendor boot.img does: dtb_size=252757 at 0x670)
     tail = bytes(boot[off + align(ssize, page):])
-    out = bytes(boot[:off]) + new_second + b"\0" * pad + tail
+    head = bytearray(boot[:off])
+    struct.pack_into("<I", head, 0x18, len(new_second))   # second_size
+    out = bytes(head) + new_second + b"\0" * pad + tail
 
     # sanity: nothing before `second` may change except second_size @0x18
     diff = [i for i in range(off) if boot[i] != out[i]]
@@ -166,8 +182,9 @@ def main():
     p.add_argument("file")
     p.add_argument("--logo", help="U-Boot logo.bmp")
     p.add_argument("--kernel-logo", help="kernel logo_kernel.bmp")
-    p.add_argument("--expect-w", type=int, default=654)
-    p.add_argument("--expect-h", type=int, default=270)
+    p.add_argument("--expect-w", type=int, default=None)
+    p.add_argument("--expect-h", type=int, default=None)
+    p.add_argument("--expect-bpp", type=int, default=None)
     p.add_argument("-o", "--out", required=True)
     p.set_defaults(func=cmd_set)
     args = ap.parse_args()
