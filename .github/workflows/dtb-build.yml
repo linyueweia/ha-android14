@@ -86,6 +86,9 @@ jobs:
           nodes, paths = D.load(sys.argv[1])
           def has(p):
               return p in nodes
+          def has_node(prefix):
+              """节点名常带 unit address（ramoops@110000 / drm-logo@0），按前缀找。"""
+              return any(k == prefix or k.startswith(prefix + "@") for k in nodes)
           checks = {
               '/firmware/optee': 'optee (Android TEE)',
               '/reserved-memory/ramoops': 'ramoops',
@@ -95,7 +98,7 @@ jobs:
           }
           bad = []
           for p, what in checks.items():
-              ok = has(p)
+              ok = has_node(p)
               print(('OK   ' if ok else 'MISS '), p, '-', what)
               if not ok: bad.append(p)
           ch = nodes.get('/chosen') or {}
@@ -127,10 +130,13 @@ jobs:
           else:
               print('display-subsystem clock-names =',
                     (ds.get('clock-names') or b'').rstrip(b'\x00'))
-          # 模型名要认得出是 H88K
-          root = nodes.get('/') or {}
+          # 模型名要认得出是 H88K。注意 dtb_diff.load 的根节点路径是空串不是 "/"
+          root = nodes.get('') or nodes.get('/') or {}
           print('model =', (root.get('model') or b'').rstrip(b'\x00').decode())
           print('compatible =', (root.get('compatible') or b'').rstrip(b'\x00').decode())
+          if b'h88k' not in (root.get('compatible') or b''):
+              bad.append('根 compatible 里没有 h88k')
+          # 12 个 nanopi6 槽位要全部落进 boot.img，这里只确认单板 dtb 认得出自己是 H88K
           if bad:
               print('FATAL: Android 节点缺失：')
               for b in bad: print('  -', b)
