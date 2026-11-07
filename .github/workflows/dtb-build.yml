@@ -35,7 +35,7 @@ jobs:
           path: sdk
           key: rk35xx-a14-kernel61-h88k-narrow-v2
 
-      - name: Partial clone SDK (narrow sparse: only what a dtb build needs)
+      - name: "Partial clone SDK - narrow sparse, only what a dtb build needs"
         if: steps.sdk-cache.outputs.cache-hit != 'true'
         run: |
           set -uo pipefail
