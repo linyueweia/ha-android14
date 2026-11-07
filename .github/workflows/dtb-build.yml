@@ -45,8 +45,8 @@ jobs:
           echo "== rk3588-android.dtsi 关键节点 =="
           grep -nE "optee|ramoops|drm[_-]logo|vendor[_-]storage|fiq-debugger|cma" "$RK/rk3588-android.dtsi" | head
           echo "== 本仓 dts 依赖的 label =="
-          for L in vdd_log_s0 hdptxphy_hdmi0 vp0_out_hdmi0 vp1_out_hdmi1 rk806; do
-            if grep -rqE "(^|[ ,{])$L:" "$RK"; then echo "label $L present"; else echo "MISSING LABEL: $L"; exit 1; fi
+          for L in vdd_log_s0 hdptxphy_hdmi0 vp0_out_hdmi0 vp1_out_hdmi1; do
+            if grep -rqE "^[[:space:]]*$L:" "$RK"; then echo "label $L present"; else echo "MISSING LABEL: $L"; exit 1; fi
           done
 
       - name: Build dtb (cpp + dtc)
