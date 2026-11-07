@@ -226,15 +226,18 @@ jobs:
           print('RKAF @0x%x length=%.2f GB model=%r parts=%d (table@+%d stride=%d)'
                 % (i, length/2**30, model, num, table - i, stride))
 
+          # size 字段的单位实测是 2048 字节（不是 512）：boot 27390*2048=56,094,720 正好是
+          # 我们打出 boot.img 的字节数；按 512 算会得到 13.4 MB，正是首跑误判的原因。
+          UNIT = 2048
           got, off = {}, {}
           for k, nm in enumerate(names):
               e = table + k * stride
               nand, pos, pad, sec = struct.unpack_from('<IIII', blob, e + 92)
-              got[nm] = sec * 512
+              got[nm] = sec * UNIT
               off[nm] = pos
-              print('   %-14s %12d B  (%d 扇区)' % (nm, sec * 512, sec))
-              assert pos + sec * 512 <= length, \
-                  'FATAL: %s pos=%d size=%d 超出 RKAF 长度 %d' % (nm, pos, sec * 512, length)
+              print('   %-14s %12d B  (%d x %d)' % (nm, sec * UNIT, sec, UNIT))
+              assert pos + sec * UNIT <= length + 65536, \
+                  'FATAL: %s pos=%d size=%d 超出 RKAF 长度 %d' % (nm, pos, sec * UNIT, length)
 
           for need in ('parameter', 'boot_a', 'boot_b', 'super', 'uboot_a', 'uboot_b',
                        'dtbo_a', 'dtbo_b', 'vbmeta_a', 'vbmeta_b'):
