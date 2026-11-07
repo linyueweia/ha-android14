@@ -1,0 +1,7 @@
+sdk/
+*.log
+*.tgz
+*.zip
+*.img
+__pycache__/
+*.pyc

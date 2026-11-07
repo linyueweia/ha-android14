@@ -1,0 +1,197 @@
+name: dtb-build
+
+# 只编一个 dtb：rk3588-hlink-h88k.dtb
+# 不编整颗内核，只 make arch/arm64/boot/dts/rockchip/rk3588-hlink-h88k.dtb
+# 用友善 RK3588 Android 的内核树（rk35xx-android14 / kernel-6.1）和 nanopi6_android_defconfig，
+# 保证编出来的 dtb 与后续要注入的官方 Android 镜像同源同配置。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-dtb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bc flex bison libssl-dev libelf-dev python3-dev device-tree-compiler
+          gcc --version | head -1; dtc --version
+
+      # gitea 到 Azure runner 的链路 39-54 分钟，首次之后走 cache
+      - name: Restore SDK kernel tree from cache
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: sdk
+          key: rk35xx-a14-kernel61-h88k-v1
+
+      - name: Partial clone SDK (kernel-6.1 only)
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          URL=http://112.124.9.243:3000/friendlyelec/rk35xx-android14.git
+          ok=0
+          for i in 1 2 3 4 5; do
+            rm -rf sdk
+            if git clone --depth 1 --filter=blob:none --no-checkout "$URL" sdk \
+               && git -C sdk sparse-checkout set --cone kernel-6.1 \
+               && git -C sdk checkout -f; then
+              ok=1; echo "CLONE_OK attempt=$i"; break
+            fi
+            echo "clone attempt $i failed, retry in 45s"
+            rm -rf sdk
+            sleep 45
+          done
+          [ "$ok" = "1" ] && [ -d sdk/kernel-6.1 ] || { echo CLONE_FAILED; exit 1; }
+          du -sh sdk/.git sdk/kernel-6.1
+          df -h /
+
+      - name: Verify SDK baseline has rk3588-android.dtsi
+        run: |
+          set -euo pipefail
+          D=sdk/kernel-6.1/arch/arm64/boot/dts/rockchip
+          test -f "$D/rk3588-android.dtsi" || { echo "FATAL: 内核树里没有 rk3588-android.dtsi"; exit 1; }
+          test -f "$D/rk3588.dtsi" || { echo "FATAL: 没有 rk3588.dtsi"; exit 1; }
+          test -f "$D/rk3588-rk806-single.dtsi" || { echo "FATAL: 没有 rk3588-rk806-single.dtsi"; exit 1; }
+          echo "== rk3588-android.dtsi 关键节点 =="
+          grep -nE "optee|ramoops|drm_logo|vendor_storage|fiq-debugger|cma" "$D/rk3588-android.dtsi" | head
+          echo "== 本仓 dts 依赖的 label 是否都存在 =="
+          for L in vdd_log_s0 hdptxphy_hdmi0 vp0_out_hdmi0 vp1_out_hdmi1 hdmi0 hdmi1; do
+            if grep -rqE "(^|[ ,{])$L:" "$D" --include=*.dtsi --include=*.dts; then
+              echo "label $L present"
+            else
+              echo "MISSING LABEL: $L"; exit 1
+            fi
+          done
+
+      - name: Install H88K dts + register in Makefile
+        run: |
+          set -euo pipefail
+          DDIR=sdk/kernel-6.1/arch/arm64/boot/dts/rockchip
+          cp dts/rk3588-hlink-h88k-android.dts "$DDIR/rk3588-hlink-h88k.dts"
+          python3 - <<'EOF'
+          p = "sdk/kernel-6.1/arch/arm64/boot/dts/rockchip/Makefile"
+          s = open(p).read()
+          if "rk3588-hlink-h88k.dtb" in s:
+              print("already registered"); raise SystemExit
+          anchor = "\trk3588-nanopi6-rev01.dtb"
+          i = s.index(anchor)
+          line_start = s.rfind("\n", 0, i) + 1
+          ins = "\trk3588-hlink-h88k.dtb \\\n"
+          s = s[:line_start] + ins + s[line_start:]
+          open(p, "w").write(s)
+          print("registered before rk3588-nanopi6-rev01.dtb")
+          EOF
+          grep -n "h88k" "$DDIR/Makefile"
+
+      - name: Prepare defconfig (nanopi6_android + ES8388)
+        run: |
+          set -euo pipefail
+          cd sdk/kernel-6.1
+          DC=arch/arm64/configs/nanopi6_android_defconfig
+          test -f "$DC" || { echo "FATAL: 没有 nanopi6_android_defconfig"; ls arch/arm64/configs | grep -i android; exit 1; }
+          cp "$DC" arch/arm64/configs/h88k_android_defconfig
+          make ARCH=arm64 h88k_android_defconfig
+          # H88K 板载 codec 是 ES8388（nanopi6 用 RT5616），不打开则耳机口全哑
+          ./scripts/config --file .config --enable SND_SOC_ES8388
+          # H88K 的 RTC 是 HYM8563
+          ./scripts/config --file .config --enable RTC_DRV_HYM8563
+          make ARCH=arm64 olddefconfig
+          for k in SND_SOC_ES8388 RTC_DRV_HYM8563; do
+            echo -n "$k = "; grep -E "^CONFIG_$k=" .config || echo "(not set)"
+          done
+
+      - name: Build H88K dtb
+        run: |
+          # pipefail 必须有：make 失败而 tee 成功会假绿
+          set -euo pipefail
+          cd sdk/kernel-6.1
+          make ARCH=arm64 -j$(nproc) rockchip/rk3588-hlink-h88k.dtb 2>&1 | tee /tmp/dtb_build.log | tail -40
+          D=arch/arm64/boot/dts/rockchip/rk3588-hlink-h88k.dtb
+          test -s "$D" || { echo "FATAL: dtb 没生成"; exit 1; }
+          sz=$(stat -c %s "$D"); echo "dtb size=$sz"
+          # RK3588 带完整 SoC 描述的 dtb 在 180-240 KB；明显偏小说明只编了个壳
+          [ "$sz" -gt 150000 ] || { echo "FATAL: dtb 只有 $sz B，明显没真编译"; exit 1; }
+
+      - name: Inspect generated dtb (Android nodes must be present)
+        run: |
+          set -euo pipefail
+          D=sdk/kernel-6.1/arch/arm64/boot/dts/rockchip/rk3588-hlink-h88k.dtb
+          python3 - "$D" <<'PY'
+          import sys
+          sys.path.insert(0, 'tools')
+          import dtb_diff as D
+          nodes, paths = D.load(sys.argv[1])
+          def has(p):
+              return p in nodes
+          checks = {
+              '/firmware/optee': 'optee (Android TEE)',
+              '/reserved-memory/ramoops': 'ramoops',
+              '/reserved-memory/drm-logo': 'drm-logo (开机 logo 内存)',
+              '/vendor-storage': 'vendor-storage',
+              '/fiq-debugger': 'fiq-debugger',
+          }
+          bad = []
+          for p, what in checks.items():
+              ok = has(p)
+              print(('OK   ' if ok else 'MISS '), p, '-', what)
+              if not ok: bad.append(p)
+          # chosen.bootargs 必须有 console=ttyFIQ0（android.dtsi 提供的）
+          ch = nodes.get('/chosen') or {}
+          ba = (ch.get('bootargs') or b'').rstrip(b'\x00').decode('utf8', 'replace')
+          print('chosen.bootargs =', ba[:160])
+          if 'console=ttyFIQ0' not in ba:
+              bad.append('/chosen bootargs 缺 console=ttyFIQ0')
+          # cma：只能有 reg，不能同时有 size
+          cma = nodes.get('/reserved-memory/cma') or {}
+          print('cma keys =', sorted(k for k in cma if not k.startswith('linux,')))
+          if 'size' in cma:
+              bad.append('cma 同时有 size 和 reg（shared-dma-pool 会失败）')
+          if 'reg' not in cma:
+              bad.append('cma 缺 reg')
+          # vop-supply 必须在（缺了显示异常）
+          vop = nodes.get('/vop@fdd90000') or nodes.get('/vop') or {}
+          if 'vop-supply' not in vop:
+              bad.append('vop 缺 vop-supply')
+          else:
+              print('vop-supply present')
+          # display-subsystem 的 hdmi0_phy_pll
+          ds = nodes.get('/display-subsystem') or {}
+          if 'clock-names' not in ds:
+              bad.append('display-subsystem 缺 hdmi0_phy_pll 时钟')
+          else:
+              print('display-subsystem clock-names =',
+                    (ds.get('clock-names') or b'').rstrip(b'\x00'))
+          if bad:
+              print('FATAL: Android 节点缺失：')
+              for b in bad: print('  -', b)
+              raise SystemExit(1)
+          print('ALL ANDROID NODE CHECKS PASSED')
+          PY
+
+      - name: SoC IP enable matrix
+        run: |
+          set -euo pipefail
+          D=sdk/kernel-6.1/arch/arm64/boot/dts/rockchip/rk3588-hlink-h88k.dtb
+          python3 tools/dtb_features.py "$D" | tee /tmp/feat.txt
+          {
+            echo "## SoC IP matrix (H88K)"
+            echo '```'
+            cat /tmp/feat.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload dtb
+        uses: actions/upload-artifact@v4
+        with:
+          name: h88k-dtb
+          path: |
+            sdk/kernel-6.1/arch/arm64/boot/dts/rockchip/rk3588-hlink-h88k.dtb
+            /tmp/dtb_build.log
+          retention-days: 14
