@@ -59,7 +59,9 @@ jobs:
               "$RK/rk3588-hlink-h88k.dts" -o /tmp/h88k.pre.dts
           wc -l /tmp/h88k.pre.dts
           # RK3588 的 dtsi 里满是 unit_address / 过时 gpio 写法，这些警告不重要
-          dtc -I dts -O dtb -o /tmp/h88k.dtb /tmp/h88k.pre.dts 2>/tmp/dtc.log || {
+          # -@ 生成 __symbols__（官方 nanopi6 dtb 里有，友善编译时 CONFIG_OF_OVERLAY=y
+          # 会自动加 -@；不加则两边结构不一致，dtbo overlay 场景可能找不到 label）
+          dtc -@ -I dts -O dtb -o /tmp/h88k.dtb /tmp/h88k.pre.dts 2>/tmp/dtc.log || {
             echo "===== DTC 失败 ====="; tail -40 /tmp/dtc.log; exit 1; }
           echo "===== dtc 警告（前 20 条）====="
           grep -E "^(Warning|ERROR)" /tmp/dtc.log | head -20 || true
