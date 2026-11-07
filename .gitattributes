@@ -1,0 +1,9 @@
+# 全部强制 LF：CI 里 workflow 的 run 块和 .dts 被 CRLF 污染会直接炸
+* text=auto eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.dts text eol=lf
+*.dtsi text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
