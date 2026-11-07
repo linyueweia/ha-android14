@@ -24,31 +24,49 @@ jobs:
           sudo apt-get install -y -qq build-essential bc flex bison libssl-dev libelf-dev python3-dev device-tree-compiler
           gcc --version | head -1; dtc --version
 
-      # gitea 到 Azure runner 的链路 39-54 分钟，首次之后走 cache
+      # gitea（112.124.9.243:3000）到 Azure runner 只有 ~200KB/s，
+      # 整棵 kernel-6.1（1.5GB+）checkout 要 1 小时以上。
+      # 只编一个 dtb 需要的东西其实很小：dts/rockchip + include/dt-bindings + scripts(dtc/kconfig)。
+      # 所以用「blob 懒取 + 窄 sparse」，首轮 ~250MB，之后走 cache 秒级。
       - name: Restore SDK kernel tree from cache
         id: sdk-cache
         uses: actions/cache@v4
         with:
           path: sdk
-          key: rk35xx-a14-kernel61-h88k-v1
+          key: rk35xx-a14-kernel61-h88k-narrow-v2
 
-      - name: Partial clone SDK (kernel-6.1 only)
+      - name: Partial clone SDK (narrow sparse: only what a dtb build needs)
         if: steps.sdk-cache.outputs.cache-hit != 'true'
         run: |
+          set -uo pipefail
           URL=http://112.124.9.243:3000/friendlyelec/rk35xx-android14.git
+          SPARSE=(
+            '/kernel-6.1/Makefile'
+            '/kernel-6.1/Kbuild'
+            '/kernel-6.1/arch/arm64/Makefile'
+            '/kernel-6.1/arch/arm64/Kbuild'
+            '/kernel-6.1/arch/arm64/boot/dts/rockchip/'
+            '/kernel-6.1/arch/arm64/configs/'
+            '/kernel-6.1/include/'
+            '/kernel-6.1/scripts/'
+          )
           ok=0
-          for i in 1 2 3 4 5; do
+          for i in 1 2 3; do
+            echo "=== clone attempt $i ==="
             rm -rf sdk
-            if git clone --depth 1 --filter=blob:none --no-checkout "$URL" sdk \
-               && git -C sdk sparse-checkout set --cone kernel-6.1 \
-               && git -C sdk checkout -f; then
-              ok=1; echo "CLONE_OK attempt=$i"; break
+            # --filter=blob:none：只取 commit/tree 对象，文件内容按需拉
+            if git clone --depth 1 --filter=blob:none --no-checkout "$URL" sdk; then
+              git -C sdk sparse-checkout set --no-cone "${SPARSE[@]}" \
+                && GIT_LFS_SKIP_SMUDGE=1 git -C sdk checkout -f \
+                && [ -f sdk/kernel-6.1/Makefile ] \
+                && [ -d sdk/kernel-6.1/arch/arm64/boot/dts/rockchip ] \
+                && ok=1 && { echo "CLONE_OK attempt=$i"; break; }
             fi
-            echo "clone attempt $i failed, retry in 45s"
+            echo "clone attempt $i failed, retry in 30s"
             rm -rf sdk
-            sleep 45
+            sleep 30
           done
-          [ "$ok" = "1" ] && [ -d sdk/kernel-6.1 ] || { echo CLONE_FAILED; exit 1; }
+          [ "$ok" = "1" ] || { echo CLONE_FAILED; exit 1; }
           du -sh sdk/.git sdk/kernel-6.1
           df -h /
 
@@ -155,12 +173,18 @@ jobs:
               bad.append('cma 同时有 size 和 reg（shared-dma-pool 会失败）')
           if 'reg' not in cma:
               bad.append('cma 缺 reg')
-          # vop-supply 必须在（缺了显示异常）
+          # vop：厂商 A12 dtb 只有 assigned-clocks/rates + power-domains，
+          # 不写 vop-supply（那是 RK3568 的形态；RK3588 VOP 走 power-domain）。
           vop = nodes.get('/vop@fdd90000') or nodes.get('/vop') or {}
-          if 'vop-supply' not in vop:
-              bad.append('vop 缺 vop-supply')
+          if 'vop-supply' in vop:
+              bad.append('vop 出现 vop-supply（RK3588 不该有，厂商 dtb 也没有）')
           else:
-              print('vop-supply present')
+              print('vop-supply absent (correct)')
+          acr = vop.get('assigned-clock-rates')
+          if acr is None:
+              bad.append('vop 缺 assigned-clock-rates=<800MHz>')
+          else:
+              print('vop assigned-clock-rates =', int.from_bytes(acr[:4], 'big'))
           # display-subsystem 的 hdmi0_phy_pll
           ds = nodes.get('/display-subsystem') or {}
           if 'clock-names' not in ds:
