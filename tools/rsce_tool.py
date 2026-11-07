@@ -77,7 +77,11 @@ def build_rcs(entries, header=None, count=None):
     for e in entries:
         blk = bytearray(e["raw"][:ENT])
         nm = e["name"].encode("utf-8")[:255]
-        blk[4:260] = nm.ljust(256, b"\0")
+        # only touch the name field when it actually changes: Rockchip leaves
+        # junk in the unused tail of path[256], and rewriting it changes bytes
+        # that a golden roundtrip (replace with the same blob) must preserve.
+        if blk[4:260].split(b"\0")[0] != nm:
+            blk[4:260] = nm.ljust(256, b"\0")
         struct.pack_into("<II", blk, 260, e["offset"], e["size"])
         idx += blk
     return bytes(hdr) + bytes(idx) + bytes(body)
@@ -150,13 +154,20 @@ def boot_replace(boot, pattern, dtb, fill_range=None):
     page, off, ssize = info["page_size"], info["second_off"], info["second_size"]
     second = boot[off : off + ssize]
     new_second = replace_in_rcs(second, pattern, dtb, fill_range)
+    # RSCE keeps its own 512-byte granularity (stock images are 512-multiples)
+    new_second += b"\0" * ((-len(new_second)) % HDR)
     pad = (-len(new_second)) % page
+    # v2 header may carry a separate dtb segment after `second` (the vendor H88K
+    # Android 12 boot.img does: dtb_size=252757). Dropping it breaks the SHA1 and
+    # the boot. Keep whatever follows, byte for byte.
+    tail = boot[off + ((ssize + page - 1) // page) * page:]
     head = bytearray(boot[:off])
     struct.pack_into("<I", head, 0x18, len(new_second))
-    out = bytes(head) + new_second + b"\0" * pad
+    out = bytes(head) + new_second + b"\0" * pad + tail
     print(
         f"boot: second {ssize} -> {len(new_second)} (+{pad} page pad); "
-        f"file {len(boot)} -> {len(out)}; second_offset={off} page={page}"
+        f"file {len(boot)} -> {len(out)}; second_offset={off} page={page}; "
+        f"tail {len(tail)} kept"
     )
     # sanity: everything before second must be byte-identical except second_size @0x18
     diff = [i for i in range(off) if boot[i] != out[i]]
