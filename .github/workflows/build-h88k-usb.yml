@@ -100,7 +100,7 @@ jobs:
           cp "$src" "$D/boot.orig.img"
           # 12 个 nanopi6 槽全换成 H88K，两个 logo 一起换，second_size 与 boot 头 SHA1 重算。
           # pack_boot.py 自带断言：槽数、容量、id MATCH、cmdline 未被改动。
-          python3 tools/pack_boot.py "$D/boot.orig.img" \
+          python3 tools/pack_boot.py --stock "$D/boot.orig.img" \
               --dtb "$DTB" \
               --logo logos/h88k-lockup-512x128.bmp \
               --kernel-logo logos/h88k-lockup-512x128.bmp \
