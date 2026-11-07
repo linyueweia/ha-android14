@@ -11,11 +11,42 @@
 |---|---|---|
 | S1 | 编出 `rk3588-hlink-h88k.dtb`（Android 化） | ✅ 285,685 B / 1,568 节点 |
 | S2 | 换掉官方镜像里的 dtb，出 SD 卡镜像 | ✅ `out/h88k-a14-sd-8g.img`（8 GiB） |
-| S3 | SD 卡实机启动（串口 + HDMI） | ⏳ 等上板 |
+| S2b | USB 线刷包（RKAF `update.img`） | ✅ [Release `h88k-a14-v1.0.0`](https://github.com/linyueweia/ha-android14/releases/tag/h88k-a14-v1.0.0) |
+| S3 | 实机启动（串口 + HDMI） | ⏳ 等上板 |
 | S4 | 按失败点补 dts | 未开始 |
-| S5 | eMMC 线刷包（需先解决 U-Boot 共存） | 未开始 |
+| S5 | eMMC 与 NVMe 的 U-Boot 共存 | 未开始（现在 eMMC 承载 U-Boot，刷 eMMC 会让 NVMe 上的 fnOS 起不来） |
 
-产出的东西和怎么烧：见 **`docs/H88K-烧写指南.md`**。
+两条线怎么烧：SD 卡看 **`docs/H88K-烧写指南.md`**，USB 线刷看 **`docs/H88K-USB线刷说明.txt`**。
+
+## USB 线刷包
+
+Release 里两个文件（都是 1.03 GB）：
+
+| 文件 | 内容 | 用途 |
+|---|---|---|
+| `H88K-Android14-update.img.zip` | RKAF 容器 `update.img`（2.33 GB，15 个分区） | RKDevTool「升级固件」一键刷 |
+| `H88K-Android14-partitions.zip` | `parameter.txt` + `MiniLoaderAll.bin` + 各分区 img + `说明.txt` | 一键刷失败时按 LBA 逐分区写 |
+
+由 `.github/workflows/build-h88k-usb.yml` 产出，用 Rockchip 官方 `afptool` + `rkImageMaker`
+打真正的 RKAF（不是自己拼容器格式），链路是：
+
+```
+下载友善底包(1 GB, ~20 s) → cpp+dtc 编 dtb(20 s) → pack_boot 换 12 槽+2 logo+SHA1
+→ afptool 打 RKAF → rkImageMaker 套 RKFW → 结构校验 → zip(44%) → Release
+```
+
+三处和 TM（rk3568）那份不同，都是 rk3588 的实际情况：
+
+1. **A/B 双槽全写**：`uboot/dtbo/vbmeta/boot` 的 `_a` 和 `_b` 都进包。TM 是单槽只写 `_a`，
+   这里漏 `_b` 会让首次启动切到空槽直接起不来。
+2. **TAG 不写死**：从 `MiniLoaderAll.bin` 偏移 21 读 4 字节再反序（`8853` → `3588`）。
+3. **产物级校验**：不只查分区表，还在 `pos` 处真读内容 —— `boot_a` 是 `ANDROID!`、
+   `parameter` 是 `FIRMWARE_VER`、`super` 是 sparse magic。afptool 出错最典型的就是
+   "条目录了、数据没写"，只有真读才拦得住。
+
+踩过的两个格式坑（都写进校验器注释了）：RKAF 的 `num_parts` 在 `+136`（厂商包实测，
+`+134` 是 138 字节头的旧版本），分区 `size` 字段单位是 **2048 字节**不是 512 ——
+按 512 算会把 53.5 MB 的 boot 读成 13.4 MB，看着像"包坏了"，其实是单位错。
 
 ## 为什么不能照抄 NanoPC-T6 的包
 
@@ -58,6 +89,13 @@ CI 里只做 `cpp -nostdinc -I... -undef -D__DTS__` + `dtc -@`，
 再断言 Android 关键节点（optee / ramoops / drm-logo / vendor-storage / fiq-debugger /
 chosen.bootargs 有 `console=ttyFIQ0` / cma 只有 reg / vop 无 supply 但 800MHz /
 display-subsystem 两个 PHY PLL），最后上传 artifact。
+
+`build-h88k-usb.yml`：USB 线刷包，见上面「USB 线刷包」一节。手动触发可填 `release_tag`
+直接发 Release，也可以推 `h88k-*` 标签自动发。
+
+```bash
+gh workflow run build-h88k-usb.yml -f release_tag=h88k-a14-v1.0.0 -f with_partitions=true
+```
 
 **全程 40-60 秒**（之前从 gitea 克隆整棵树跑 31 分钟连 clone 都没完成）。
 
