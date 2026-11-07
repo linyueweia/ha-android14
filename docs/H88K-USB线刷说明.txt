@@ -1,0 +1,140 @@
+H88K（RK3588）Android 14 USB 线刷包 说明
+==========================================
+
+产物
+----
+H88K-Android14-update.img.zip   Rockchip RKAF 容器，里面是 update.img。
+                                解压后交给 RKDevTool / upgrade_tool 一把刷。
+H88K-Android14-partitions.zip   parameter.txt + MiniLoaderAll.bin + 各分区 img，
+                                用「分区烧写」兜底（update.img 刷不动时用这个）。
+
+刷什么
+------
+boot_a / boot_b 两个槽都放的是同一份 H88K boot.img：友善的 nanopi6 dtb 12 个
+硬件版本槽（rev01…rev0c）全部替换成我们编的 rk3588-hlink-h88k.dtb，
+连开机 logo（logo.bmp / logo_kernel.bmp）一起换了，boot 头 SHA1 已重算。
+
+==============================================================================
+一、Windows：RKDevTool（推荐，图形界面）
+==============================================================================
+
+1. 装驱动
+   DriverAssistant_v5.x\DriverInstall.exe → 安装。
+   装完设备管理器里应出现 "Rockchip USB Device"。
+
+2. 让板子进 MaskROM / Loader 模式
+   断电 → 按住板上的 MASKROM（或 RECOVERY）键不放 → 插 USB-C/OTG 线到电脑
+   → 保持 3 秒再松手。
+   RKDevTool 下方会显示「发现一个 MASKROM 设备」。
+   若显示「发现一个 LOADER 设备」也能刷。
+
+3. 刷
+   RKDevTool → 「升级固件」页 → 「固件」选择解压出来的 update.img
+   → 点「升级」。中途不要拔线。
+   进度到 100% 后板子自动重启。
+
+   提示：如果 update.img 报「固件无效 / 不匹配」，改走第二条「分区烧写」，
+   不需要 update.img。
+
+==============================================================================
+二、Windows：分区烧写（update.img 出问题时的兜底）
+==============================================================================
+
+RKDevTool → 「下载镜像」页，按下面顺序填（右键表格 → 添加项）：
+
+  地址/LBA        文件名
+  ------------    ----------------------
+  (loader)        MiniLoaderAll.bin        ← 先在「高级功能」里下载 loader
+  0x00000040      idbloader.img            ← 64 扇区，BootROM 固定偏移
+  0x00002000      uboot.img                (uboot_a)
+  0x00006000      uboot.img                (uboot_b)
+  0x00008000      misc.img
+  0x0000a000      dtbo.img                 (dtbo_a)
+  0x0000c000      dtbo.img                 (dtbo_b)
+  0x0000e000      vbmeta.img               (vbmeta_a)
+  0x0000f000      vbmeta.img               (vbmeta_b)
+  0x00010000      boot.img                 (boot_a)  ← 我们的 H88K boot
+  0x00030000      boot.img                 (boot_b)
+  0x00050000      backup.img               (全零，可不写)
+  0x00136400      baseparameter.img
+  0x00138400      super.img                (2.24 GB，sparse，刷得最久)
+  0x00778400      (userdata:grow，留空，首次开机自己 mkfs)
+
+  最后勾上「强制按地址写」，点「执行」。
+
+==============================================================================
+三、Linux / macOS：upgrade_tool 或 rkdeveloptool
+==============================================================================
+
+upgrade_tool（Rockchip 官方，需 apt/官网取）：
+  # 进 MaskROM 后
+  sudo upgrade_tool db  MiniLoaderAll.bin
+  sudo upgrade_tool ul  MiniLoaderAll.bin
+  sudo upgrade_tool di  -p parameter.txt
+  sudo upgrade_tool wl  0x00000040 idbloader.img
+  sudo upgrade_tool wl  0x00002000 uboot.img
+  sudo upgrade_tool wl  0x00006000 uboot.img
+  sudo upgrade_tool wl  0x00008000 misc.img
+  sudo upgrade_tool wl  0x0000a000 dtbo.img
+  sudo upgrade_tool wl  0x0000c000 dtbo.img
+  sudo upgrade_tool wl  0x0000e000 vbmeta.img
+  sudo upgrade_tool wl  0x0000f000 vbmeta.img
+  sudo upgrade_tool wl  0x00010000 boot.img
+  sudo upgrade_tool wl  0x00030000 boot.img
+  sudo upgrade_tool wl  0x00136400 baseparameter.img
+  sudo upgrade_tool wl  0x00138400 super.img
+  sudo upgrade_tool rd
+
+  一把刷（有 update.img 时）：
+  sudo upgrade_tool uf update.img
+
+rkdeveloptool（开源替代）：
+  sudo rkdeveloptool db  MiniLoaderAll.bin
+  sudo rkdeveloptool wl  0x40         idbloader.img
+  sudo rkdeveloptool wl  0x2000       uboot.img
+  sudo rkdeveloptool wl  0x6000       uboot.img
+  sudo rkdeveloptool wl  0x8000       misc.img
+  sudo rkdeveloptool wl  0xa000       dtbo.img
+  sudo rkdeveloptool wl  0xc000       dtbo.img
+  sudo rkdeveloptool wl  0xe000       vbmeta.img
+  sudo rkdeveloptool wl  0xf000       vbmeta.img
+  sudo rkdeveloptool wl  0x10000      boot.img
+  sudo rkdeveloptool wl  0x30000      boot.img
+  sudo rkdeveloptool wl  0x136400     baseparameter.img
+  sudo rkdeveloptool wl  0x138400     super.img
+  sudo rkdeveloptool rd
+
+  注意 rkdeveloptool 的 LBA 是十六进制且**不带 0x 前缀时也按十六进制解析**，
+  上面写法带 0x 更保险。
+
+==============================================================================
+四、刷完怎么判断成功
+==============================================================================
+
+串口：H88K 的调试串口是 GPIO0_B5(TX) / GPIO0_B6(RX)，115200 和 1500000 都试，
+      8N1，3.3V TTL（不要接 5V）。
+      看到 "Model: HINLINK OWL H88K Board" 之类的行就说明 dtb 生效了。
+
+只有 HDMI、没串口：
+  10 秒内出现 H88K logo（我们换的那个）→ 30-60 秒内出现开机动画 → 3-5 分钟进桌面。
+
+==============================================================================
+五、风险与注意
+==============================================================================
+
+1. 线刷会**覆盖 eMMC 的全部内容**（uboot / boot / super / userdata）。
+   本机 eMMC 上原有的东西会没了；NVMe 上的系统不受影响，但建议先拔掉 NVMe
+   或确认 eMMC 上没有要留的数据。
+
+2. 这是**未经真机验证**的适配包（第一版）。友善的 U-Boot 里带 T6 的板级初值，
+   如果卡在 U-Boot 阶段（串口停住不动），下一步是换成厂商 A12 的 uboot.img 再试。
+
+3. AVB 不会拦：底包的 vbmeta.img 是空壳（VERIFICATION_DISABLED +
+   HASHTREE_DISABLED，无描述符），改 boot 不会被校验拒绝。
+
+4. super.img 是 sparse 格式，刷写时间明显长于其他分区（2.2 GB），
+   进度条走得慢是正常的，不要中途拔线。
+
+5. 分区表来自友善官方 parameter.txt（GPT，16 个分区 + userdata grow）。
+   地址一栏的数值都从这份 parameter.txt 解析，和仓库里 tools/make_usb_package.py
+   生成的 flash-usb 脚本一致。

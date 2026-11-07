@@ -1,0 +1,335 @@
+name: build-h88k-usb
+
+# USB 线刷包（MaskROM + RKDevTool / upgrade_tool）
+#   1. H88K-Android14-update.img.zip  —— Rockchip RKAF 容器（afptool + rkImageMaker 打包）
+#                                        再 zip 压，RKDevTool 一键刷
+#   2. H88K-Android14-partitions.zip  —— parameter.txt + MiniLoaderAll.bin + 各分区 img，
+#                                        「分区烧写」兜底（dispatch 时 with_partitions=true 才出）
+#
+# 与 TM（rk3568）那份的差别，全部是 H88K/rk3588 的实际情况：
+#   - dtb 有 12 个硬件版本槽（rk3588-nanopi6-rev01…rev0c），U-Boot 按 hwrev 探测挑槽，
+#     H88K 不是友善板、探测值不可预测 → 12 个槽全替换，只换一个会走回 T6 的树；
+#   - A/B 双槽：uboot/dtbo/vbmeta/boot 的 _a 和 _b 都要写。TM 是单槽，只写 _a 没问题；
+#     这里漏掉 _b，首次启动切槽会直接起不来（_b 是空的）。
+#   - 打包前先编 dtb（仓库内 27 文件闭包 + cpp + dtc，几十秒），不依赖 gitea 克隆。
+on:
+  workflow_dispatch:
+    inputs:
+      src_url:
+        description: android-14 partition bundle
+        required: false
+        default: https://downloads.friendlyelec.com/os-images/rk3588/images/android-14-images-20251222.tgz
+      release_tag:
+        description: 可选：填了就同时发布到 Release（如 h88k-a14-v1.0.0），留空只出 artifact
+        required: false
+        default: ""
+      with_partitions:
+        description: 额外产出分区包（约 1 GB，与 update.img 内容重复，仅打包失败兜底时需要）
+        required: false
+        default: "false"
+  push:
+    tags:
+      - "h88k-*"
+
+permissions:
+  contents: write
+
+env:
+  TREE: vendor/dts-tree
+  RK: vendor/dts-tree/arch/arm64/boot/dts/rockchip
+  DTB: out/rk3588-hlink-h88k.dtb
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      PKG: H88K-Android14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq device-tree-compiler python3 zip unzip file
+          dtc --version; df -h /
+
+      - name: Build dtb (cpp + dtc, vendored tree)
+        run: |
+          set -euo pipefail
+          test -f "$RK/rk3588-android.dtsi" || { echo "FATAL: 缺 rk3588-android.dtsi"; exit 1; }
+          cp dts/rk3588-hlink-h88k-android.dts "$RK/rk3588-hlink-h88k.dts"
+          cpp -nostdinc -I"$TREE/include" -I"$RK" \
+              -undef -D__DTS__ -x assembler-with-cpp \
+              "$RK/rk3588-hlink-h88k.dts" -o /tmp/h88k.pre.dts
+          mkdir -p out
+          # -@ 生成 __symbols__：官方 nanopi6 dtb 带符号表（友善 CONFIG_OF_OVERLAY=y），
+          # 不加两边结构不一致
+          dtc -@ -I dts -O dtb -o "$DTB" /tmp/h88k.pre.dts 2>/tmp/dtc.log || {
+            echo "===== DTC 失败 ====="; tail -40 /tmp/dtc.log; exit 1; }
+          echo "dtc 警告数: $(grep -cE '^Warning' /tmp/dtc.log || true)"
+          python3 - "$DTB" <<'PY'
+          import struct, sys
+          d = open(sys.argv[1], 'rb').read()
+          magic, tot = struct.unpack('>II', d[:8])
+          assert magic == 0xd00dfeed, hex(magic)
+          assert len(d) > 150000, 'dtb 只有 %d B，明显没真编译' % len(d)
+          print('dtb %d B, FDT magic OK, totalsize=%d' % (len(d), tot))
+          PY
+
+      - name: Fetch bundle
+        run: |
+          set -eux
+          for i in 1 2 3 4 5; do
+            curl -L --fail --connect-timeout 20 --max-time 3600 \
+                 --retry 5 --retry-delay 10 --retry-all-errors \
+                 -o images.tgz "${{ github.event.inputs.src_url || 'https://downloads.friendlyelec.com/os-images/rk3588/images/android-14-images-20251222.tgz' }}" && break
+            echo "retry $i"; sleep 15
+          done
+          ls -l images.tgz; sha256sum images.tgz
+          mkdir -p parts && tar xzf images.tgz -C parts
+          find parts -maxdepth 2 -type f -printf '%10s %p\n' | sort -k2 | head -25
+
+      - name: Stage usb/ and inject H88K dtb into boot.img
+        run: |
+          set -euxo pipefail
+          mkdir -p usb
+          D=usb
+          pick() { find parts -name "$1" -type f | head -1; }
+          src=$(pick boot.img); [ -n "$src" ] || { echo "FATAL: 底包里没有 boot.img"; exit 1; }
+          cp "$src" "$D/boot.orig.img"
+          # 12 个 nanopi6 槽全换成 H88K，两个 logo 一起换，second_size 与 boot 头 SHA1 重算。
+          # pack_boot.py 自带断言：槽数、容量、id MATCH、cmdline 未被改动。
+          python3 tools/pack_boot.py "$D/boot.orig.img" \
+              --dtb "$DTB" \
+              --logo logos/h88k-lockup-512x128.bmp \
+              --kernel-logo logos/h88k-lockup-512x128.bmp \
+              -o "$D/boot.img" | tee /tmp/pack.txt
+          grep -q '12 slot(s)' /tmp/pack.txt || { echo "FATAL: dtb 没铺满 12 个槽"; exit 1; }
+          grep -q 'MATCH' /tmp/pack.txt      || { echo "FATAL: boot 头 SHA1 没重算"; exit 1; }
+
+          # 产物级校验：不是「算过了」，是「字节真的在里面」
+          python3 - <<'PY'
+          d = open('usb/boot.img', 'rb').read()
+          b = open('out/rk3588-hlink-h88k.dtb', 'rb').read()
+          n = d.count(b)
+          print('dtb 在 boot.img 里出现 %d 次（预期 12）' % n)
+          assert n == 12, 'FATAL: 只出现 %d 次' % n
+          PY
+
+          missing=""
+          for f in parameter.txt MiniLoaderAll.bin idbloader.img uboot.img misc.img \
+                   dtbo.img vbmeta.img super.img baseparameter.img; do
+            s=$(pick "$f" || true)
+            if [ -n "$s" ]; then cp "$s" "$D/$f"; else echo "MISSING $f"; missing="$missing $f"; fi
+          done
+          ls -l "$D"
+          [ -z "$missing" ] || { echo "底包没提供:$missing"; exit 1; }
+
+      - name: Build update.img (Rockchip RKAF/RKFW)
+        run: |
+          set -euxo pipefail
+          cd usb
+          # afptool / rkImageMaker 在 RKTools 里（rkbin 只有固件 bin）
+          rm -rf /tmp/rktools
+          git clone --depth 1 --filter=blob:none --sparse \
+              https://github.com/rockchip-toybrick/RKTools.git /tmp/rktools
+          git -C /tmp/rktools sparse-checkout set linux/Linux_Pack_Firmware/rockdev
+          TOOLS=/tmp/rktools/linux/Linux_Pack_Firmware/rockdev
+          ls -l "$TOOLS"
+          chmod +x "$TOOLS"/afptool "$TOOLS"/rkImageMaker
+          file "$TOOLS"/afptool "$TOOLS"/rkImageMaker || true
+
+          # rkImageMaker -os_type:androidos 强制要求 backup 分区（"No found backup partition!"），
+          # 友善的包不带 backup.img → 按 parameter.txt 的扇区数造零文件
+          [ -f parameter.txt ] || { echo "FATAL: parameter.txt 缺失"; ls -l; exit 1; }
+          BK=$(sed -n 's/.*CMDLINE:[^:]*://p' parameter.txt | tr ',' '\n' \
+               | grep -oE '0x[0-9a-f]+@0x[0-9a-f]+\(backup\)' | cut -d'@' -f1 | head -1) || true
+          [ -n "$BK" ] || { echo "FATAL: parameter.txt 没有 backup 分区"; exit 1; }
+          [ -f backup.img ] || { truncate -s $(( BK * 512 )) backup.img; echo "造 backup.img $(( BK * 512 )) B"; }
+
+          # package-file 两列 NAME<TAB>path（三列会把第三列当路径 -> <AddFile> err=2）
+          PARTS=$(sed -n 's/.*CMDLINE:[^:]*://p' parameter.txt | tr ',' '\n' \
+                  | sed -n 's/.*(\([a-z0-9_]*\).*/\1/p' | sed 's/:.*//')
+          echo "参数分区:"; echo "$PARTS"
+          {
+            printf '# NAME\tpath\n'
+            printf 'package-file\tpackage-file\n'
+            printf 'bootloader\tMiniLoaderAll.bin\n'
+            printf 'parameter\tparameter.txt\n'
+            for p in $PARTS; do
+              case "$p" in
+                userdata|security) continue ;;      # grow / 不打包
+                *_a) base=${p%_a} ;;
+                *_b) base=${p%_b} ;;                # A/B：_b 也要写，用同一个 img
+                *)   base=$p ;;
+              esac
+              if [ -f "$p.img" ]; then f="$p.img"
+              elif [ -f "$base.img" ]; then f="$base.img"
+              else continue; fi
+              printf '%s\t%s\n' "$p" "$f"
+            done
+          } > package-file
+          cat -A package-file | head -25
+
+          "$TOOLS/afptool" -pack ./ update.raw.img
+          # TAG 从 MiniLoaderAll.bin 偏移 21 读 4 字节再反序：rk3588 的 loader 里存的是
+          # "8853"，反序得 3588 -> -RK3588。写死会随 loader 版本错。
+          TAG=RK$(hexdump -s 21 -n 4 -e '4 "%c"' MiniLoaderAll.bin | rev)
+          echo "TAG=$TAG"
+          "$TOOLS/rkImageMaker" -${TAG} MiniLoaderAll.bin update.raw.img update.img -os_type:androidos
+          rm -f update.raw.img package-file
+          ls -l update.img; sha256sum update.img
+
+      - name: Verify update.img structure
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import struct, os, sys
+          p = 'usb/update.img'
+          sz = os.path.getsize(p)
+          f = open(p, 'rb')
+          head = f.read(0x100)
+          assert head[:4] == b'RKFW', 'FATAL: 没有 RKFW magic，rkImageMaker 没成功'
+          print('RKFW 头 OK, update.img = %.2f GB' % (sz / 2**30))
+          # RKAF 容器在 RKFW 头 + loader 之后；扫前 6 MB 找它
+          f.seek(0); blob = f.read(6 << 20)
+          i = blob.find(b'RKAF')
+          assert i > 0, 'FATAL: 找不到 RKAF 容器'
+          length = struct.unpack_from('<I', blob, i + 4)[0]
+          model = blob[i+8:i+42].rstrip(b'\x00').decode('utf8', 'replace')
+          # 布局是拿厂商 A12 包逐字节实测出来的，不是猜的：
+          #   num_parts u32 LE @+136，分区条目 @+140、每条 112 B：
+          #   name[32] file[60] nand@+92 pos@+96 padded@+100 size@+104
+          #   pos 是相对 RKAF 起点的字节偏移；size/padded 单位是**扇区**（×512 才是字节）
+          num = struct.unpack_from('<I', blob, i+136)[0]
+          print('RKAF @ 0x%x length=%.2f GB model=%r parts=%d' % (i, length/2**30, model, num))
+          assert 1 <= num <= 64, 'FATAL: num_parts=%d 不合理，头布局对不上' % num
+          got = {}
+          for k in range(num):
+              e = i + 140 + k * 112
+              nm = blob[e:e+32].split(b'\x00')[0].decode('ascii', 'replace')
+              nand, pos, pad, sec = struct.unpack_from('<IIII', blob, e+92)
+              got[nm] = sec * 512
+              print('   %-14s %12d B  (%d 扇区)' % (nm, sec * 512, sec))
+          for need in ('parameter', 'boot_a', 'boot_b', 'super', 'uboot_a', 'uboot_b',
+                       'dtbo_a', 'dtbo_b', 'vbmeta_a', 'vbmeta_b'):
+              assert need in got, 'FATAL: RKAF 里没有 %s' % need
+          assert got['boot_a'] == got['boot_b'], 'FATAL: boot_a/b 大小不一致'
+          assert got['boot_a'] > 50 * 2**20, 'FATAL: boot 只有 %.1f MB' % (got['boot_a']/2**20)
+          assert got['super'] > 2 * 2**30, 'FATAL: super 只有 %.2f GB' % (got['super']/2**30)
+          print('RKAF 分区齐全（A/B 双槽 + super），boot=%.1f MB super=%.2f GB'
+                % (got['boot_a']/2**20, got['super']/2**30))
+
+          # 内容抽查：分区表说明「登记了」，这里说明「数据真的在那个 pos 上」。
+          # afptool 出错时最常见的是条目录了、数据没写（空壳包），刷上去才发现。
+          def head_of(name, n=16):
+              for k in range(num):
+                  b = i + 140 + k * 112
+                  if blob[b:b+32].split(b'\x00')[0].decode('ascii', 'replace') == name:
+                      pos = struct.unpack_from('<I', blob, b + 96)[0]
+                      f.seek(i + pos)
+                      return f.read(n)
+              raise AssertionError('no such part: ' + name)
+
+          assert head_of('boot_a', 8) == b'ANDROID!', 'FATAL: boot_a 开头不是 ANDROID!'
+          assert head_of('parameter', 32).startswith(b'FIRMWARE_VER'), 'FATAL: parameter 内容不对'
+          sup = head_of('super', 4)
+          assert sup == b'\x3a\xff\x26\xed' or sup == b'\x30\x50\x4c\x41', \
+              'FATAL: super 既不是 sparse 也不是 LP（%r）' % sup
+          print('内容抽查 OK: boot_a=ANDROID!  parameter=FIRMWARE_VER  super=%s'
+                % ('sparse' if sup == b'\x3a\xff\x26\xed' else 'LP-raw'))
+          PY
+
+      - name: Compress update.img (zip/deflate)
+        if: always()
+        run: |
+          set -euxo pipefail
+          if [ ! -f usb/update.img ]; then
+            echo "update.img 没产出（打包失败？）—— 跳过压缩"
+            exit 0
+          fi
+          RAW=$(stat -c%s usb/update.img)
+          cd usb
+          ZIPNAME="$PKG-update.img.zip"
+          # 为什么 zip 不是 zstd：Windows 资源管理器/7-Zip/WinRAR 都能双击开 zip，
+          # .zst 要新版 7-Zip 才行。Release 单文件上限 2 GiB，zip 足够。
+          zip -9 -q "$ZIPNAME" update.img
+          rm -f update.img
+          ZIP=$(stat -c%s "$ZIPNAME")
+          RATIO=$(awk -v a="$ZIP" -v b="$RAW" 'BEGIN{printf "%.1f", a*100/b}')
+          echo "update.img: $RAW B -> $ZIPNAME: $ZIP B (${RATIO}%)"
+          sha256sum "$ZIPNAME" > "$ZIPNAME.sha256" && cat "$ZIPNAME.sha256"
+          echo "ZIP_BYTES=$ZIP" >> "$GITHUB_ENV"
+          echo "RAW_BYTES=$RAW" >> "$GITHUB_ENV"
+          echo "ZIP_RATIO=$RATIO" >> "$GITHUB_ENV"
+          [ "$ZIP" -lt 2000000000 ] || { echo "FATAL: zip > 2 GB，Release 传不上去"; exit 1; }
+
+      - name: Pack partitions zip (optional)
+        if: always() && github.event.inputs.with_partitions == 'true'
+        run: |
+          set -euxo pipefail
+          cd usb
+          cp ../docs/H88K-USB线刷说明.txt 说明.txt
+          zip -r "../$PKG-partitions.zip" . \
+              -x 'update.img' "$PKG-update.img.zip" "$PKG-update.img.zip.sha256"
+          ls -l "../$PKG-partitions.zip"
+
+      - name: Evidence
+        if: always()
+        run: |
+          {
+            echo "## H88K USB 线刷包"
+            echo '```'
+            ls -l usb/ 2>/dev/null || true
+            ls -l "$PKG-partitions.zip" 2>/dev/null || true
+            if [ -n "${ZIP_BYTES:-}" ]; then
+              printf 'update.img %s B -> .zip %s B (%s%%)\n' "${RAW_BYTES}" "${ZIP_BYTES}" "${ZIP_RATIO}"
+            fi
+            echo '--- boot 打包 ---'
+            cat /tmp/pack.txt 2>/dev/null || true
+            echo '```'
+            echo
+            echo "**刷机**：解压 \`$PKG-update.img.zip\` 得 \`update.img\`，RKDevTool「升级固件」一键刷；"
+            echo "失败就用分区包按 \`说明.txt\` 逐分区写。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 只在构建成功后发 Release（always() 会在失败时发个空壳，标签还要手工删）
+      - name: Publish to Release
+        if: success() && (github.event.inputs.release_tag != '' || startsWith(github.ref, 'refs/tags/'))
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
+          name: H88K（RK3588）Android 14 ${{ github.event.inputs.release_tag || github.ref_name }}
+          body: |
+            H88K（RK3588）跑友善 Android 14 的线刷包。dtb 是本仓 `dts/rk3588-hlink-h88k-android.dts`
+            现编的，12 个硬件版本槽全部替换，两家开机 logo 一起换掉，boot 头 SHA1 已重算。
+
+            - `H88K-Android14-update.img.zip` —— 解出 `update.img`，RKDevTool「升级固件」一键刷
+              （Windows 自带解压即可；`sha256sum -c` 可校验）
+            - `H88K-Android14-partitions.zip` —— 分区烧写兜底，含 `说明.txt` 与 `parameter.txt`
+
+            **状态：未经真机验证**。已验证的是链路每一环：dtb 结构对得上官方 nanopi6 dtb
+            （SoC IP 状态一致，差的只是 T6 特有外设）、boot.img 12 槽 + logo + SHA1、
+            RKAF 容器里 A/B 双槽与 super 齐全、AVB 是空壳不拦。
+            线刷会覆盖 eMMC 全部内容，先确认 eMMC 上没有要留的数据。
+
+            串口：GPIO0_B5(TX)/GPIO0_B6(RX)，8N1，3.3V TTL。
+          files: |
+            usb/${{ env.PKG }}-update.img.zip
+            usb/${{ env.PKG }}-update.img.zip.sha256
+            ${{ env.PKG }}-partitions.zip
+          fail_on_unmatched_files: false
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}-usb
+          path: |
+            usb/${{ env.PKG }}-update.img.zip
+            usb/${{ env.PKG }}-update.img.zip.sha256
+            ${{ env.PKG }}-partitions.zip
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: warn
