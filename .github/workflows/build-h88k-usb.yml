@@ -214,7 +214,9 @@ jobs:
                   ok = True
                   for k in range(num):
                       nm = blob[table + k*stride: table + k*stride + 32].split(b'\x00')[0]
-                      if not nm or not re.fullmatch(rb'[a-z0-9_]+', nm):
+                      # package-file 这个条目名里带连字符，正则必须放行，否则第一个名字就判非法、
+                      # 所有候选布局都被否掉（这是上一跑失败的原因）
+                      if not nm or not re.fullmatch(rb'[a-z0-9_-]+', nm):
                           ok = False; break
                       names.append(nm.decode())
                   if ok:
